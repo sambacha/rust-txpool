@@ -1,14 +1,51 @@
 use regex::Regex;
 use serde_json::{Value, json};
 use std::fs::File;
-use std::io::{self, Read};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{self, Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
+    // Initialize emit with OTLP
+    let rt = emit::setup()
+        .emit_to(emit_otlp::new()
+            .resource(emit::props! {
+                #[emit::key("service.name")]
+                service_name: "rust-txpool-parser",
+                #[emit::key("service.version")]
+                service_version: env!("CARGO_PKG_VERSION"),
+            })
+            .logs(emit_otlp::logs_grpc_proto(
+                std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string())
+            ))
+            .metrics(emit_otlp::metrics_grpc_proto(
+                std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string())
+            ))
+            .traces(emit_otlp::traces_grpc_proto(
+                std::env::var("OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string())
+            ))
+            .spawn())
+        .and_emit_to(emit_term::stdout())  // Also log to stdout for debugging
+        .init();
 
-    let json_value = parse_debug_format(&input)?;
+    let start_time = Instant::now();
+    
+    emit::info!("Starting txpool parser");
+    
+    let mut input = String::new();
+    let bytes_read = io::stdin().read_to_string(&mut input)?;
+    
+    emit::emit!(
+        "{metric_agg} of {metric_name} is {metric_value}",
+        evt_kind: "metric",
+        metric_agg: "count",
+        metric_name: "txpool.input.bytes",
+        metric_value: bytes_read,
+    );
+
+    let parse_result = parse_debug_format(&input);
+    
+    let json_value = parse_result?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
@@ -16,8 +53,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filename = format!("txpool_{}.json", timestamp);
 
     let mut file = File::create(&filename)?;
-    serde_json::to_writer_pretty(&mut file, &json_value)?;
+    let json_string = serde_json::to_string_pretty(&json_value)?;
+    let output_bytes = json_string.len();
+    file.write_all(json_string.as_bytes())?;
+    
+    emit::emit!(
+        "{metric_agg} of {metric_name} is {metric_value}",
+        evt_kind: "metric",
+        metric_agg: "count",
+        metric_name: "txpool.output.bytes",
+        metric_value: output_bytes,
+    );
+    
+    let duration_ms = start_time.elapsed().as_millis();
+    emit::emit!(
+        "{metric_agg} of {metric_name} is {metric_value}",
+        evt_kind: "metric",
+        metric_agg: "last",
+        metric_name: "txpool.parse.duration_ms",
+        metric_value: duration_ms,
+    );
 
+    emit::info!("Converted output saved to {filename}", filename, duration_ms);
+    
+    // Flush emit to ensure all metrics are sent
+    rt.blocking_flush(std::time::Duration::from_secs(5));
+    
     println!("Converted output saved to {}", filename);
     Ok(())
 }
@@ -120,6 +181,10 @@ fn parse_txpool_inspect(input: &str) -> Result<Value, Box<dyn std::error::Error>
 fn parse_txpool_content(input: &str) -> Result<Value, Box<dyn std::error::Error>> {
     let mut cleaned = input.to_string();
     
+    // Metrics collection
+    let mut type_wrapper_counts: HashMap<&str, i64> = HashMap::new();
+    let parse_start = Instant::now();
+    
     // Step 1: Remove type wrappers and clean up structure indicators
     let type_wrappers = [
         "TxpoolContent", "AnyRpcTransaction", "WithOtherFields", "Transaction",
@@ -130,13 +195,45 @@ fn parse_txpool_content(input: &str) -> Result<Value, Box<dyn std::error::Error>
         "Create", "AccessListItem", "TxEip7702", "Eip7702", "Authorization"
     ];
     
+    let wrapper_count = type_wrappers.len();
+    emit::debug!("Starting type wrapper removal for {wrapper_count} wrapper types", wrapper_count);
+    
     for wrapper in &type_wrappers {
-        cleaned = cleaned.replace(&format!("{} {{", wrapper), "{");
-        cleaned = cleaned.replace(&format!("{}(", wrapper), "(");
+        let brace_pattern = format!("{} {{", wrapper);
+        let brace_count = cleaned.matches(&brace_pattern).count();
+        if brace_count > 0 {
+            *type_wrapper_counts.entry(wrapper).or_insert(0) += brace_count as i64;
+            cleaned = cleaned.replace(&brace_pattern, "{");
+        }
+        
+        let paren_pattern = format!("{}(", wrapper);
+        let paren_count = cleaned.matches(&paren_pattern).count();
+        if paren_count > 0 {
+            *type_wrapper_counts.entry(wrapper).or_insert(0) += paren_count as i64;
+            cleaned = cleaned.replace(&paren_pattern, "(");
+        }
+        
         // Handle cases with newlines
-        cleaned = Regex::new(&format!(r"{}\s*\{{", wrapper))?
-            .replace_all(&cleaned, "{")
-            .to_string();
+        let regex_pattern = format!(r"{}\s*\{{", wrapper);
+        let regex = Regex::new(&regex_pattern)?;
+        let newline_count = regex.find_iter(&cleaned).count();
+        if newline_count > 0 {
+            *type_wrapper_counts.entry(wrapper).or_insert(0) += newline_count as i64;
+            cleaned = regex.replace_all(&cleaned, "{").to_string();
+        }
+    }
+    
+    // Emit metrics for each type wrapper
+    for (wrapper_name, count) in &type_wrapper_counts {
+        emit::emit!(
+            "{metric_agg} of {metric_name} is {metric_value}",
+            evt_kind: "metric",
+            metric_agg: "count",
+            metric_name: "txpool.type_wrapper.instances",
+            metric_value: count,
+            wrapper_type: wrapper_name,
+        );
+        emit::debug!("Found {count} instances of type wrapper: {wrapper_name}", count, wrapper_name);
     }
     
     // Step 2: Handle Some/None and special values
@@ -154,13 +251,25 @@ fn parse_txpool_content(input: &str) -> Result<Value, Box<dyn std::error::Error>
         "authorization_list"
     ];
     
+    let mut field_replacements = 0i64;
     for field in &field_names {
         let pattern = format!(r"\b{}\s*:", field);
         let replacement = format!("\"{}\":", field);
-        cleaned = Regex::new(&pattern)?
-            .replace_all(&cleaned, replacement.as_str())
-            .to_string();
+        let regex = Regex::new(&pattern)?;
+        let matches = regex.find_iter(&cleaned).count();
+        if matches > 0 {
+            field_replacements += matches as i64;
+            cleaned = regex.replace_all(&cleaned, replacement.as_str()).to_string();
+        }
     }
+    
+    emit::emit!(
+        "{metric_agg} of {metric_name} is {metric_value}",
+        evt_kind: "metric",
+        metric_agg: "count",
+        metric_name: "txpool.field.replacements",
+        metric_value: field_replacements,
+    );
     
     // Step 4: Handle Create for contract creation (after field names are quoted)
     cleaned = cleaned.replace("Create,", "null,");
@@ -269,15 +378,44 @@ fn parse_txpool_content(input: &str) -> Result<Value, Box<dyn std::error::Error>
     cleaned = final_cleaned;
     
     // Parse as JSON
+    let parse_duration_ms = parse_start.elapsed().as_millis();
+    
+    let parse_duration_ms_i64 = parse_duration_ms as i64;
+    emit::emit!(
+        "{metric_agg} of {metric_name} is {metric_value}",
+        evt_kind: "metric",
+        metric_agg: "last",
+        metric_name: "txpool.content.parse_duration_ms",
+        metric_value: parse_duration_ms_i64,
+    );
+    
     match serde_json::from_str(&cleaned) {
-        Ok(json) => Ok(json),
+        Ok(json) => {
+            emit::info!("Successfully parsed txpool content in {parse_duration_ms}ms", parse_duration_ms);
+            Ok(json)
+        },
         Err(e) => {
+            let error_line = e.line();
+            let error_column = e.column();
+            emit::emit!(
+                "{metric_agg} of {metric_name} is {metric_value}",
+                evt_kind: "metric",
+                metric_agg: "count",
+                metric_name: "txpool.parse.errors",
+                metric_value: 1,
+                error_type: "json_parse_error",
+                error_line,
+                error_column,
+            );
+            
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
                 .as_secs();
             let debug_filename = format!("debug_clean_{}.txt", timestamp);
             std::fs::write(&debug_filename, &cleaned)?;
             
+            let error_msg = format!("{}", e);
+            emit::error!("JSON parse error: {error} at line {line} column {column}", error: error_msg, line: error_line, column: error_column);
             eprintln!("JSON parse error: {}", e);
             eprintln!("Cleaned output saved to {} for debugging", debug_filename);
             Err(e.into())
