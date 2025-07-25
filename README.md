@@ -1,6 +1,6 @@
 # `rust-txpool`
 
-> ![WARNING]
+> [!WARNING]    
 > Pure Generated Code, there be slooop
 
 ## Metrics Collected
